@@ -1,7 +1,7 @@
 package asyncsqs
 
 import (
-	"math/rand"
+	"crypto/rand"
 	"strconv"
 	"sync"
 	"testing"
@@ -13,16 +13,6 @@ import (
 	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/require"
 )
-
-var letters = []rune("0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ")
-
-func randString(n int) string {
-	r := make([]rune, n)
-	for i := range r {
-		r[i] = letters[rand.Intn(len(letters))]
-	}
-	return string(r)
-}
 
 func TestNew(t *testing.T) {
 	assert := require.New(t)
@@ -52,29 +42,6 @@ func TestNew(t *testing.T) {
 	assert.Equal(c.DeleteBufferSize, defaultBufferSize)
 	assert.Equal(c.SendConcurrency, c.SendBufferSize/maxBatchSize)
 	assert.Equal(c.DeleteConcurrency, c.DeleteBufferSize/maxBatchSize)
-}
-
-func TestError(t *testing.T) {
-	assert := require.New(t)
-
-	c, err := NewBufferedClient(Config{
-		SQSClient: new(mockSQSClient),
-		QueueURL:  "https://sqs.us-east-1.amazonaws.com/xxxxxxxxxxxx/some-queue",
-	})
-	assert.NotNil(c)
-	assert.Nil(err)
-
-	// Check validation of payload size
-	sizeExceedingLimit := (maxPayloadBytes / maxBatchSize) + 1
-	assert.NotNil(c.SendMessageAsync(types.SendMessageBatchRequestEntry{
-		Id:          aws.String("some id"),
-		MessageBody: aws.String(randString(sizeExceedingLimit)),
-	}))
-
-	// Async funcs should return error after stopping
-	c.Stop()
-	assert.NotNil(c.SendMessageAsync())
-	assert.NotNil(c.DeleteMessageAsync())
 }
 
 func TestAsyncBatchNoWaitTime(t *testing.T) {
@@ -259,12 +226,9 @@ func TestAsyncBatchWithWaitTime(t *testing.T) {
 				}
 			}()
 
-			wg.Wait() // wait for all async calls to be accepted
-
+			wg.Wait()     // wait for all async calls to be accepted
 			client.Stop() // stop client; test that draining of remaining requests work
-
-			msgs.Wait() // wait for all batches to be dispatched
-
+			msgs.Wait()   // wait for all batches to be dispatched
 			// assert SQS requests made
 			mockSQSClient.AssertExpectations(t)
 
@@ -285,5 +249,84 @@ func TestAsyncBatchWithWaitTime(t *testing.T) {
 			assert.Equal(s.MessagesDeleted, uint64(numMsgs))
 			assert.Equal(s.SendMessageBatchCalls+s.DeleteMessageBatchCalls, uint64(len(batchSizes)))
 		})
+	}
+}
+
+func TestBatchRequestSendBodySize(t *testing.T) {
+	bytesToKb := 1024
+	inputBatchBySizes := []int{
+		256 * bytesToKb,
+		56 * bytesToKb, 200 * bytesToKb,
+		25 * bytesToKb, 25 * bytesToKb, 25 * bytesToKb, 25 * bytesToKb, 25 * bytesToKb, 25 * bytesToKb, 25 * bytesToKb, 25 * bytesToKb, 25 * bytesToKb, 25 * bytesToKb,
+		256 * bytesToKb,
+		56 * bytesToKb, 200 * bytesToKb,
+	}
+	assert := require.New(t)
+
+	// messages to be sent
+	numMsgs := 5
+	msgs := &sync.WaitGroup{}
+	msgs.Add(numMsgs)
+
+	// setup to record every batch message size during dispatch
+	batchSizes := make([]int, 0, numMsgs)
+	batchMu := &sync.RWMutex{}
+	recordBatchSize := func(batch []types.SendMessageBatchRequestEntry) {
+		batchMu.Lock()
+		bodySize := 0
+		for _, item := range batch {
+			bodySize += len(*item.MessageBody)
+		}
+		batchSizes = append(batchSizes, bodySize)
+		batchMu.Unlock()
+		msgs.Done()
+	}
+	// delay between successive calls to SendMessageAsync or DeleteMessageAsync
+	// should transate to roughly 5 or less in a batch but not more
+	delayBetweenAsyncCalls := 50 * time.Millisecond
+
+	// mock SQS calls
+	mockSQSClient := new(mockSQSClient)
+	mockSQSClient.On("SendMessageBatch",
+		mock.AnythingOfType("*context.emptyCtx"),
+		mock.AnythingOfType("*sqs.SendMessageBatchInput")).
+		Return(nil, nil).
+		Maybe().                        // flexible no. of calls
+		Run(func(args mock.Arguments) { // hook to inspect and record batch size
+			recordBatchSize(args.Get(1).(*sqs.SendMessageBatchInput).Entries)
+		})
+
+	client, err := NewBufferedClient(Config{
+		SQSClient: mockSQSClient,
+		QueueURL:  "https://sqs.us-east-1.amazonaws.com/xxxxxxxxxxxx/some-queue",
+	})
+	assert.NotNil(client)
+	assert.Nil(err)
+	defer client.Stop()
+
+	wg := &sync.WaitGroup{}
+
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for i, input := range inputBatchBySizes {
+			data := make([]byte, input)
+			_, _ = rand.Read(data)
+			_ = client.SendMessageAsync(types.SendMessageBatchRequestEntry{
+				Id:          aws.String(strconv.Itoa(i)),
+				MessageBody: aws.String(string(data)),
+			})
+			time.Sleep(delayBetweenAsyncCalls)
+		}
+	}()
+	wg.Wait()     // wait for all async calls to be accepted
+	client.Stop() // stop client; test that draining of remaining requests work
+	msgs.Wait()   // wait for all batches to be dispatched
+	// assert SQS requests made
+	mockSQSClient.AssertExpectations(t)
+
+	for _, bs := range batchSizes {
+		// assert that neither empty nor full batch is ever dispatched
+		assert.True(bs > 0 && bs <= maxPayloadBytes)
 	}
 }
