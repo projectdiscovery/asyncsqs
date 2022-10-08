@@ -16,6 +16,7 @@ when
 
 * either batch becomes full
 * or waiting period exhausts (if configured)
+* or the batch total body size becomes grater than or equal to 256 kb. (addition)
 
 ...**whichever occurs earlier**.
 
@@ -97,15 +98,3 @@ func sendResponseHandler(output *sqs.SendMessageBatchOutput, err error) {
 	}
 }
 ```
-
-### Limitation
-
-While asyncsqs ensures batch size doesn't exceed SQS's limit of 10 messages,
-it does not validate size of the payload **yet**. SQS places following limits
-on batch request payload:
-
-    The maximum allowed individual message size and the maximum total payload size
-    (the sum of the individual lengths of all of the batched messages) are both
-    256 KB (262,144 bytes).
-
-This translates to an average payload limit of around 25KB per individual message.
