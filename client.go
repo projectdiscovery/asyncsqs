@@ -180,14 +180,18 @@ func (c *BufferedClient) Stats() Stats {
 // SendMessageAsync schedules message(s) to be sent. It blocks if the send
 // buffer is full.
 func (c *BufferedClient) SendMessageAsync(entries ...types.SendMessageBatchRequestEntry) error {
+	var messageTotalBytes int
+
 	if c.stopped {
 		return fmt.Errorf("client stopped")
 	}
 
 	for _, entry := range entries {
-		if len(*entry.MessageBody) > maxPayloadBytes/maxBatchSize {
-			return fmt.Errorf("individual message size cannot exceed %d bytes", maxPayloadBytes/maxBatchSize)
-		}
+		messageTotalBytes += len(*entry.MessageBody)
+	}
+
+	if messageTotalBytes > maxPayloadBytes {
+		return fmt.Errorf("The total message size is %d, the max size should be %d bytes", messageTotalBytes, maxPayloadBytes)
 	}
 
 	for _, entry := range entries {
