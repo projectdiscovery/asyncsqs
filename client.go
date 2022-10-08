@@ -185,8 +185,8 @@ func (c *BufferedClient) SendMessageAsync(entries ...types.SendMessageBatchReque
 	}
 
 	for _, entry := range entries {
-		if len(*entry.MessageBody) > maxPayloadBytes/maxBatchSize {
-			return fmt.Errorf("individual message size cannot exceed %d bytes", maxPayloadBytes/maxBatchSize)
+		if len(*entry.MessageBody) > maxPayloadBytes {
+			return fmt.Errorf("individual message size cannot exceed %d bytes", maxPayloadBytes)
 		}
 	}
 
@@ -243,6 +243,7 @@ func (c *BufferedClient) batcher(queue chan genericEntry, waitTime time.Duration
 	for {
 		var arr [maxBatchSize]genericEntry
 		var batch = arr[:0]
+	inner:
 		for {
 			select {
 			case entry, ok := <-queue:
@@ -254,7 +255,31 @@ func (c *BufferedClient) batcher(queue chan genericEntry, waitTime time.Duration
 					}
 					return
 				}
+				// if we exceed total batch size, send.
+				batchCurrentSize := c.calculateBatchSize(batch)
+				if batchCurrentSize >= maxPayloadBytes {
+					jobs <- batch
+					break inner
+				}
+				// if we exceed total batch size after new addition, dispatch, clean array and
+				// then start appending of entry.
+				if entry.sendReq.MessageBody != nil {
+					batchNewEntrySize := batchCurrentSize + len(*entry.sendReq.MessageBody)
+					if entry.sendReq.MessageBody != nil && batchNewEntrySize >= maxPayloadBytes {
+						if len(batch) == 0 || batchNewEntrySize == maxPayloadBytes {
+							batch = append(batch, entry)
+							jobs <- batch
+							batch = arr[:0]
+							continue inner
+						}
+						jobs <- batch
+						batch = arr[:0]
+						batch = append(batch, entry)
+						continue inner
+					}
+				}
 				batch = append(batch, entry)
+
 				if len(batch) != maxBatchSize {
 					// batch hasn't filled up yet, continue to wait
 					continue
@@ -269,6 +294,18 @@ func (c *BufferedClient) batcher(queue chan genericEntry, waitTime time.Duration
 			break // break inner loop, create a new batch
 		}
 	}
+}
+
+// calculateBatchSize calculates batch send size for messages
+func (c *BufferedClient) calculateBatchSize(items []genericEntry) int {
+	var totalSize int
+	for _, item := range items {
+		// Only calculate body if message is send-request type
+		if item.sendReq.MessageBody != nil {
+			totalSize += len(*item.sendReq.MessageBody)
+		}
+	}
+	return totalSize
 }
 
 func (c *BufferedClient) dispatcher(batches chan []genericEntry, op sqsOp, wg *sync.WaitGroup) {
